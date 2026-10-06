@@ -74,7 +74,7 @@ func (s *Store) reachableLocked() (map[Digest]struct{}, error) {
 		return nil, err
 	}
 	for _, e := range tags {
-		if e.IsDir() || isTempTagName(e.Name()) {
+		if e.IsDir() {
 			continue
 		}
 		d, err := s.readTagLocked(e.Name())

@@ -395,9 +395,17 @@ func (s *Store) putBlobLocked(desc Descriptor, b []byte) error {
 }
 
 // writeTagLocked 原子写入标签文件。
+//
+// 临时文件写在 uploads/ 下（随机名），再 rename 进 tags/：tags/ 目录里
+// 出现的每个文件都是一个真实标签，标签名与临时文件名在结构上不可能
+// 混淆，因此任何合法标签名（包括含 ".tmp" 的名字）都能安全使用。
 func (s *Store) writeTagLocked(tag string, d Digest) error {
 	final := s.tagPath(tag)
-	tmp := final + tmpSuffix + ".new"
+	tmpName, err := s.newTempName()
+	if err != nil {
+		return err
+	}
+	tmp := filepath.Join(s.uploadsPath(), tmpName)
 	if err := os.WriteFile(tmp, []byte(string(d)+"\n"), 0o644); err != nil {
 		return err
 	}
@@ -405,7 +413,10 @@ func (s *Store) writeTagLocked(tag string, d Digest) error {
 		os.Remove(tmp)
 		return err
 	}
-	return fsyncDir(filepath.Dir(final))
+	if err := fsyncDir(filepath.Dir(final)); err != nil {
+		return err
+	}
+	return fsyncDir(s.uploadsPath())
 }
 
 // Resolve 将标签解析为其清单描述符。
@@ -473,7 +484,7 @@ func (s *Store) ListTags(ctx context.Context) ([]string, error) {
 	}
 	tags := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if e.IsDir() || isTempTagName(e.Name()) {
+		if e.IsDir() {
 			continue
 		}
 		tags = append(tags, e.Name())
