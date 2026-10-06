@@ -59,6 +59,9 @@ type Store struct {
 	// 供 Unpin 时定位要删除的文件。钉住的真实状态在磁盘 pins/ 目录
 	// 中（见 pins.go），因此跨进程可见；本表只是本进程的句柄簿记。
 	pinFiles map[Digest][]string
+	// gcSweepHook 若非 nil，GC 每删除一个 blob 后回调一次。
+	// 仅用于测试模拟"回收中途进程被杀"。
+	gcSweepHook func(d Digest)
 }
 
 // Open 打开（必要时创建）位于 dir 的存储，并执行崩溃恢复：

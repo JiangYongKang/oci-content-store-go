@@ -63,6 +63,9 @@ func (s *Store) gcLocked() ([]Descriptor, error) {
 		}
 		s.logf("gc: collected digest=%s size=%d (unreachable)", d, info.Size())
 		removed = append(removed, Descriptor{Digest: d, Size: info.Size()})
+		if s.gcSweepHook != nil {
+			s.gcSweepHook(d)
+		}
 	}
 	if len(removed) > 0 {
 		if err := fsyncDir(filepath.Join(s.dir, blobsDir)); err != nil {
