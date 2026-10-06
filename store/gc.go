@@ -6,20 +6,35 @@ import (
 	"sort"
 )
 
-// gcLocked 在持有写锁的前提下执行标记-清除回收：
+// gcLocked 在持有写锁与排他文件锁的前提下执行标记-清除回收：
 //
 //  1. 标记：从所有标签出发，把标签指向的清单及其引用的
 //     config/layers 全部计入可达集合；
-//  2. 清除：遍历 blobs 目录，删除不在可达集合中的 blob。
+//  2. 清除：遍历 blobs 目录，删除不在可达集合、且未被任何进程
+//     钉住的 blob。
 //
-// 因为整个过程持有写锁，标记期间集合不会变化：被删除的内容在
+// 因为整个过程持有排他文件锁，标记期间集合不会变化：被删除的内容在
 // 删除那一刻必然没有任何有效引用，被引用的内容必然不会被删除。
+//
+// 中断安全：每个 blob 的删除都是单次 unlink，回收进程在任意时刻
+// 被 kill 都只会留下"部分垃圾尚未清掉"的自洽状态，不会出现删了
+// 一半的可用内容；下一次 GC（无论由哪个进程发起）会接着完成。
 func (s *Store) gcLocked() ([]Descriptor, error) {
 	reachable, err := s.reachableLocked()
 	if err != nil {
 		return nil, err
 	}
 	s.logf("gc: reachable set has %d digests", len(reachable))
+
+	// 跨进程钉住集合：读取的同时清理属主进程已死的残留钉住文件，
+	// 保证崩溃过的进程不会让内容永远得不到回收。
+	pinned, pruned, err := s.ppins.pinnedDigests()
+	if err != nil {
+		return nil, err
+	}
+	if pruned > 0 {
+		s.logf("gc: pruned %d stale pin files from dead processes", pruned)
+	}
 
 	entries, err := os.ReadDir(filepath.Join(s.dir, blobsDir))
 	if err != nil {
@@ -40,8 +55,13 @@ func (s *Store) gcLocked() ([]Descriptor, error) {
 			continue
 		}
 		if s.pins[d] > 0 {
-			// 客户端钉住的内容：处于"已上传、待引用"窗口期，跳过。
-			s.logf("gc: skip digest=%s (pinned)", d)
+			// 本进程钉住的内容：处于"已上传、待引用"窗口期，跳过。
+			s.logf("gc: skip digest=%s (pinned in-process)", d)
+			continue
+		}
+		if _, ok := pinned[d]; ok {
+			// 其他进程钉住的内容：同样处于上传窗口期，跳过。
+			s.logf("gc: skip digest=%s (pinned by another process)", d)
 			continue
 		}
 		info, err := e.Info()

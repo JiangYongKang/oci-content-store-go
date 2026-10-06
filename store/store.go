@@ -7,9 +7,13 @@
 //	  blobs/sha256/<hex>   内容寻址的不可变 blob
 //	  tags/<tag>           标签文件，内容为其指向的清单摘要
 //	  uploads/             写入暂存区，成功的写入会原子 rename 进 blobs
+//	  pins/                跨进程钉住文件（打开老数据时自动创建）
+//	  lock                 跨进程文件锁载体（打开老数据时自动创建）
 //
-// 所有 blob 一经 rename 发布即不可变；写入、标签变更与回收在单把
-// RWMutex 下串行化（读共享、写独占），使整个存储的操作历史可线性化。
+// 所有 blob 一经 rename 发布即不可变。进程内由一把 RWMutex 串行化
+// （读共享、写独占）；进程间由 lock 文件上的 flock 串行化（读共享、
+// 写独占）。两层锁的获取顺序固定为 RWMutex -> flock，因此同一目录
+// 被多个进程同时打开时，整体操作历史与单进程一样可线性化。
 package store
 
 import (
@@ -24,6 +28,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -36,8 +41,16 @@ const (
 	blobsDir   = "blobs/sha256"
 	tagsDir    = "tags"
 	uploadsDir = "uploads"
+	// pinsDir 存放跨进程钉住文件（v1 新增目录，老数据打开时自动创建）。
+	pinsDir = "pins"
+	// lockFile 是跨进程文件锁的载体（v1 新增文件，老数据打开时自动创建）。
+	lockFile = "lock"
 	// tmpSuffix 是发布前临时文件的后缀；恢复时据此识别残留。
 	tmpSuffix = ".tmp"
+	// tagTempSuffix 是历史版本标签临时文件（<tag>.tmp.new）的后缀。
+	// 该后缀保留给原子发布协议，标签名不得以它结尾，否则与恢复
+	// 清理逻辑无法区分（这正是带点标签曾被静默吞掉的根源）。
+	tagTempSuffix = tmpSuffix + ".new"
 )
 
 // validTagRe 限定标签字符集，标签直接映射为文件名，必须可安全落盘。
@@ -47,6 +60,9 @@ func validateTag(tag string) error {
 	if !validTagRe.MatchString(tag) {
 		return fmt.Errorf("%w: %q", ErrInvalidTag, tag)
 	}
+	if strings.HasSuffix(tag, tagTempSuffix) {
+		return fmt.Errorf("%w: %q ends with reserved suffix %q", ErrInvalidTag, tag, tagTempSuffix)
+	}
 	return nil
 }
 
@@ -55,56 +71,121 @@ type Store struct {
 	mu     sync.RWMutex
 	dir    string
 	logger Logger
+	// flock 是跨进程文件锁：进程内并发由 mu 串行化，进程间并发
+	// 由 flock 串行化，二者叠加使多进程历史与单进程一样可线性化。
+	flock fileLock
 	// pins 是内存中的引用计数钉住表：计数 > 0 的摘要不会被 GC
 	// 回收。客户端在"上传 blob -> 建立清单引用"的窗口期内钉住
-	// 内容，即可获得确定性的回收保护。仅存在于内存，重启后清空
-	// （重启后未完成上传的临时文件本就会被恢复流程清除）。
+	// 内容，即可获得确定性的回收保护。
 	pins map[Digest]int
+	// ppins 是落盘的钉住状态（pins/ 目录），把窗口期保护扩展到
+	// 跨进程：任何进程的 GC 都会尊重，属主崩溃后由恢复/回收清理。
+	ppins persistentPins
 }
 
 // Open 打开（必要时创建）位于 dir 的存储，并执行崩溃恢复：
-// 清理未完成上传、剔除指向缺失/非法内容的损坏标签。
+// 清理未完成上传、剔除指向缺失/非法内容的损坏标签、清理属主
+// 已死的残留钉住文件。恢复在排他文件锁下进行，可与并发的其他
+// 进程安全交错。老版本数据目录无需迁移：pins/ 与 lock 缺失时
+// 自动创建，既有 blobs/tags/uploads 原样沿用。
 func Open(dir string, logger Logger) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("store: empty directory")
 	}
-	for _, sub := range []string{blobsDir, tagsDir, uploadsDir} {
+	for _, sub := range []string{blobsDir, tagsDir, uploadsDir, pinsDir} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
 			return nil, fmt.Errorf("store: init %s: %w", sub, err)
 		}
 	}
-	s := &Store{dir: dir, logger: logger, pins: make(map[Digest]int)}
-	if err := s.recover(); err != nil {
+	inst, err := newInstanceID()
+	if err != nil {
 		return nil, err
 	}
-	s.logf("store opened at %s", dir)
+	s := &Store{
+		dir:    dir,
+		logger: logger,
+		pins:   make(map[Digest]int),
+		flock:  fileLock{path: filepath.Join(dir, lockFile)},
+		ppins: persistentPins{
+			dir:   filepath.Join(dir, pinsDir),
+			owner: fmt.Sprintf("%d.%s", os.Getpid(), inst),
+		},
+	}
+	// 恢复可能与其他进程的操作并发，须在排他文件锁下执行。
+	if err := s.flock.withLock(true, s.recover); err != nil {
+		return nil, err
+	}
+	s.logf("store opened at %s (owner=%s)", dir, s.ppins.owner)
 	return s, nil
 }
 
-// Close 关闭存储（当前为无操作，保留用于未来扩展）。
-func (s *Store) Close() error { return nil }
+// newInstanceID 生成本实例的随机标识，用于区分同进程内多个
+// Store 实例的钉住文件属主。
+func newInstanceID() (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
 
-// Pin 钉住一个摘要：计数 +1，被钉住的内容不会被 GC 回收。
-// 不要求内容已存在，可在上传前调用以覆盖整个"上传+引用"窗口。
-// 每次 Pin 必须配对一次 Unpin。钉住状态仅在内存中，重启后清空。
+// Close 关闭存储：释放本实例持有的全部钉住（内存计数与落盘
+// 文件），使未被引用的内容重新可被回收。进程若被强行杀死，
+// 残留钉住文件会由后续 Open 恢复或 GC 按属主存活状态清理。
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.flock.withLock(true, func() error {
+		n := len(s.pins)
+		if err := s.ppins.removeAll(); err != nil {
+			return err
+		}
+		s.pins = make(map[Digest]int)
+		if n > 0 {
+			s.logf("close: released %d pinned digests", n)
+		}
+		return nil
+	})
+}
+
+// Pin 钉住一个摘要：计数 +1，被钉住的内容不会被任何进程的 GC
+// 回收。不要求内容已存在，可在上传前调用以覆盖整个"上传+引用"
+// 窗口。每次 Pin 必须配对一次 Unpin。钉住状态会落盘（pins/），
+// 因此跨进程生效；进程崩溃后残留钉住由恢复/回收自动清理。
 func (s *Store) Pin(d Digest) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.pins[d]++
-	s.logf("pin digest=%s count=%d", d, s.pins[d])
+	_ = s.flock.withLock(true, func() error {
+		if s.pins[d] == 0 {
+			// 0->1 转换时落盘。I/O 失败无法经返回值上报（保持接口
+			// 兼容），记录日志；内存钉住仍然生效，进程内保护不降级。
+			if err := s.ppins.add(d); err != nil {
+				s.logf("pin digest=%s: persist failed (in-process pin still active): %v", d, err)
+			}
+		}
+		s.pins[d]++
+		s.logf("pin digest=%s count=%d", d, s.pins[d])
+		return nil
+	})
 }
 
 // Unpin 解除一次钉住；计数归零后内容重新可被 GC 回收。
 func (s *Store) Unpin(d Digest) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.pins[d] <= 1 {
-		delete(s.pins, d)
-		s.logf("unpin digest=%s count=0", d)
-		return
-	}
-	s.pins[d]--
-	s.logf("unpin digest=%s count=%d", d, s.pins[d])
+	_ = s.flock.withLock(true, func() error {
+		if s.pins[d] <= 1 {
+			delete(s.pins, d)
+			if err := s.ppins.remove(d); err != nil {
+				s.logf("unpin digest=%s: remove pin file failed: %v", d, err)
+			}
+			s.logf("unpin digest=%s count=0", d)
+			return nil
+		}
+		s.pins[d]--
+		s.logf("unpin digest=%s count=%d", d, s.pins[d])
+		return nil
+	})
 }
 
 func (s *Store) logf(format string, args ...any) {
@@ -152,7 +233,13 @@ func (s *Store) PutContent(ctx context.Context, desc Descriptor, r io.Reader) er
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.flock.withLock(true, func() error {
+		return s.putContentLocked(ctx, desc, r)
+	})
+}
 
+// putContentLocked 在持有进程内写锁与排他文件锁的前提下执行写入。
+func (s *Store) putContentLocked(ctx context.Context, desc Descriptor, r io.Reader) error {
 	finalPath := s.blobPath(desc.Digest)
 	if info, err := os.Stat(finalPath); err == nil {
 		// 内容已存在：必须复用同一份存储。校验已有文件与声明一致，
@@ -270,7 +357,12 @@ func (s *Store) GetContent(ctx context.Context, d Digest) ([]byte, error) {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	b, err := os.ReadFile(s.blobPath(d))
+	var b []byte
+	err := s.flock.withLock(false, func() error {
+		var err error
+		b, err = os.ReadFile(s.blobPath(d))
+		return err
+	})
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("%w: %s", ErrNotFound, d)
@@ -287,7 +379,12 @@ func (s *Store) StatContent(ctx context.Context, d Digest) (Descriptor, error) {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	info, err := os.Stat(s.blobPath(d))
+	var info os.FileInfo
+	err := s.flock.withLock(false, func() error {
+		var err error
+		info, err = os.Stat(s.blobPath(d))
+		return err
+	})
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return Descriptor{}, fmt.Errorf("%w: %s", ErrNotFound, d)
@@ -321,30 +418,40 @@ func (s *Store) PutManifest(ctx context.Context, tag string, m Manifest) (Descri
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.flock.withLock(true, func() error {
+		return s.putManifestLocked(tag, m, desc, b)
+	}); err != nil {
+		return Descriptor{}, err
+	}
+	return desc, nil
+}
 
+// putManifestLocked 在持有写锁与排他文件锁的前提下执行引用预检、
+// 清单落盘与标签发布，三步对任何进程都表现为一个原子整体。
+func (s *Store) putManifestLocked(tag string, m Manifest, desc Descriptor, b []byte) error {
 	// 引用完整性预检：缺失引用时拒绝，保证标签永远不会悬挂。
 	for _, ref := range m.references() {
 		if _, err := os.Stat(s.blobPath(ref.Digest)); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				s.logf("put-manifest REJECT missing-reference tag=%s ref=%s", tag, ref.Digest)
-				return Descriptor{}, fmt.Errorf("%w: %s required by manifest %s for tag %q",
+				return fmt.Errorf("%w: %s required by manifest %s for tag %q",
 					ErrMissingReference, ref.Digest, desc.Digest, tag)
 			}
-			return Descriptor{}, err
+			return err
 		}
 	}
 
 	// 写入清单 blob（已存在则复用）。
 	if err := s.putBlobLocked(desc, b); err != nil {
-		return Descriptor{}, err
+		return err
 	}
 
 	// 原子发布标签：先写临时文件再 rename，标签要么指向旧清单要么指向新清单。
 	if err := s.writeTagLocked(tag, desc.Digest); err != nil {
-		return Descriptor{}, err
+		return err
 	}
 	s.logf("put-manifest tag=%s manifest=%s refs=%d", tag, desc.Digest, len(m.references()))
-	return desc, nil
+	return nil
 }
 
 // putBlobLocked 写入或复用一个已在内存中的 blob。
@@ -375,17 +482,28 @@ func (s *Store) putBlobLocked(desc Descriptor, b []byte) error {
 }
 
 // writeTagLocked 原子写入标签文件。
+//
+// 临时文件写在 uploads/ 而非 tags/：tags/ 目录里任何时候都只存在
+// 完整发布的标签，带点号（如 "v1.tmp"）的合法标签名因此不可能与
+// 发布中间产物混淆。rename 跨目录但同文件系统，原子性不变。
 func (s *Store) writeTagLocked(tag string, d Digest) error {
-	final := s.tagPath(tag)
-	tmp := final + tmpSuffix + ".new"
+	tmpName, err := s.newTempName()
+	if err != nil {
+		return err
+	}
+	tmp := filepath.Join(s.uploadsPath(), tmpName)
 	if err := os.WriteFile(tmp, []byte(string(d)+"\n"), 0o644); err != nil {
 		return err
 	}
+	final := s.tagPath(tag)
 	if err := os.Rename(tmp, final); err != nil {
 		os.Remove(tmp)
 		return err
 	}
-	return fsyncDir(filepath.Dir(final))
+	if err := fsyncDir(filepath.Dir(final)); err != nil {
+		return err
+	}
+	return fsyncDir(s.uploadsPath())
 }
 
 // Resolve 将标签解析为其清单描述符。
@@ -395,17 +513,25 @@ func (s *Store) Resolve(ctx context.Context, tag string) (Descriptor, error) {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	d, err := s.readTagLocked(tag)
+	var desc Descriptor
+	err := s.flock.withLock(false, func() error {
+		d, err := s.readTagLocked(tag)
+		if err != nil {
+			return err
+		}
+		info, err := os.Stat(s.blobPath(d))
+		if err != nil {
+			// 正常运行中标签与其目标由同一把锁维护，不会走到这里；
+			// 走到了说明磁盘被外部破坏，按未找到处理。
+			return fmt.Errorf("%w: tag %q points to missing blob %s", ErrNotFound, tag, d)
+		}
+		desc = Descriptor{Digest: d, Size: info.Size()}
+		return nil
+	})
 	if err != nil {
 		return Descriptor{}, err
 	}
-	info, err := os.Stat(s.blobPath(d))
-	if err != nil {
-		// 正常运行中标签与其目标由同一把锁维护，不会走到这里；
-		// 走到了说明磁盘被外部破坏，按未找到处理。
-		return Descriptor{}, fmt.Errorf("%w: tag %q points to missing blob %s", ErrNotFound, tag, d)
-	}
-	return Descriptor{Digest: d, Size: info.Size()}, nil
+	return desc, nil
 }
 
 func (s *Store) readTagLocked(tag string) (Digest, error) {
@@ -441,16 +567,23 @@ func (s *Store) GetManifest(ctx context.Context, d Digest) (Manifest, error) {
 func (s *Store) ListTags(ctx context.Context) ([]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	entries, err := os.ReadDir(filepath.Join(s.dir, tagsDir))
+	var tags []string
+	err := s.flock.withLock(false, func() error {
+		entries, err := os.ReadDir(filepath.Join(s.dir, tagsDir))
+		if err != nil {
+			return err
+		}
+		tags = make([]string, 0, len(entries))
+		for _, e := range entries {
+			if e.IsDir() || isTempTagName(e.Name()) {
+				continue
+			}
+			tags = append(tags, e.Name())
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	tags := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() || isTempTagName(e.Name()) {
-			continue
-		}
-		tags = append(tags, e.Name())
 	}
 	sort.Strings(tags)
 	return tags, nil
@@ -463,20 +596,29 @@ func (s *Store) DeleteTag(ctx context.Context, tag string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := os.Remove(s.tagPath(tag)); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("%w: tag %q", ErrNotFound, tag)
+	return s.flock.withLock(true, func() error {
+		if err := os.Remove(s.tagPath(tag)); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("%w: tag %q", ErrNotFound, tag)
+			}
+			return err
 		}
-		return err
-	}
-	s.logf("delete-tag tag=%s", tag)
-	return fsyncDir(filepath.Join(s.dir, tagsDir))
+		s.logf("delete-tag tag=%s", tag)
+		return fsyncDir(filepath.Join(s.dir, tagsDir))
+	})
 }
 
 // GC 回收不被任何标签间接引用的 blob，返回被删除内容的描述符。
-// 可达性判定与删除在同一把写锁下完成：引用仍然有效的内容不可能被删除。
+// 可达性判定与删除在同一把写锁与排他文件锁下完成：无论本进程还是
+// 其他进程，引用仍然有效的内容都不可能被删除。
 func (s *Store) GC(ctx context.Context) ([]Descriptor, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.gcLocked()
+	var removed []Descriptor
+	err := s.flock.withLock(true, func() error {
+		var err error
+		removed, err = s.gcLocked()
+		return err
+	})
+	return removed, err
 }

@@ -7,19 +7,25 @@ import (
 	"strings"
 )
 
-// isTempTagName 判断是否为标签发布过程中的临时文件名。
+// isTempTagName 判断是否为历史版本标签发布过程留下的临时文件名
+// （<tag>.tmp.new）。必须精确匹配后缀：标签名允许包含点号，
+// "v1.tmp" 这类合法标签绝不是临时文件——曾经用"包含 .tmp"判断，
+// 导致带点标签被静默跳过列举、不计入可达性甚至被恢复流程删除。
 func isTempTagName(name string) bool {
-	return strings.Contains(name, tmpSuffix)
+	return strings.HasSuffix(name, tagTempSuffix)
 }
 
-// recover 在 Open 时执行崩溃恢复，使存储重新自洽：
+// recover 在 Open 时执行崩溃恢复，使存储重新自洽（调用方已持有
+// 排他文件锁，因此与其他进程的并发操作安全交错）：
 //
-//  1. 删除 uploads/ 下的全部残留：它们是崩溃前未完成的写入，
-//     从未被 rename 发布，因此不可能被任何标签或清单引用，
-//     也绝不能参与去重——直接清除；
-//  2. 删除 tags/ 下的临时文件（标签原子发布的中间产物）；
+//  1. 删除 uploads/ 下的全部残留：它们是崩溃前未完成的写入或
+//     未发布的标签临时文件，从未被 rename 发布，因此不可能被任何
+//     标签或清单引用，也绝不能参与去重——直接清除；
+//  2. 删除 tags/ 下历史版本遗留的临时文件（<tag>.tmp.new）；
 //  3. 校验每个正式标签：摘要非法或目标 blob 缺失的标签是损坏的，
-//     删除它们使"标签 -> 内容"关系重新自洽。
+//     删除它们使"标签 -> 内容"关系重新自洽；
+//  4. 清理属主进程已死的残留钉住文件：崩溃进程的钉住随之失效，
+//     内容重新可被回收，不会因一次崩溃永远滞留。
 //
 // blobs/ 下只存在经原子 rename 发布的完整内容，无需校验即可信；
 // 无法识别的文件保留不动（向前兼容）。
@@ -87,6 +93,15 @@ func (s *Store) recover() error {
 		if err := fsyncDir(tagsPath); err != nil {
 			return err
 		}
+	}
+
+	// 4. 清理属主进程已死的残留钉住文件。
+	pruned, err := s.ppins.pruneDead()
+	if err != nil {
+		return err
+	}
+	if pruned > 0 {
+		s.logf("recover: pruned %d stale pin files from dead processes", pruned)
 	}
 	return nil
 }
