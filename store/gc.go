@@ -21,6 +21,16 @@ func (s *Store) gcLocked() ([]Descriptor, error) {
 	}
 	s.logf("gc: reachable set has %d digests", len(reachable))
 
+	// 跨进程钉住集合：其他进程"已上传、待引用"窗口期内的内容
+	// 同样受保护；属主已退出的残留钉住在此一并收割。
+	pinned, err := s.livePinsLocked()
+	if err != nil {
+		return nil, err
+	}
+	if len(pinned) > 0 {
+		s.logf("gc: %d digests pinned across processes", len(pinned))
+	}
+
 	entries, err := os.ReadDir(filepath.Join(s.dir, blobsDir))
 	if err != nil {
 		return nil, err
@@ -39,8 +49,8 @@ func (s *Store) gcLocked() ([]Descriptor, error) {
 		if _, ok := reachable[d]; ok {
 			continue
 		}
-		if s.pins[d] > 0 {
-			// 客户端钉住的内容：处于"已上传、待引用"窗口期，跳过。
+		if _, ok := pinned[d]; ok {
+			// 某进程钉住的内容：处于"已上传、待引用"窗口期，跳过。
 			s.logf("gc: skip digest=%s (pinned)", d)
 			continue
 		}

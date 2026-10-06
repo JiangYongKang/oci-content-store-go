@@ -55,11 +55,10 @@ type Store struct {
 	mu     sync.RWMutex
 	dir    string
 	logger Logger
-	// pins 是内存中的引用计数钉住表：计数 > 0 的摘要不会被 GC
-	// 回收。客户端在"上传 blob -> 建立清单引用"的窗口期内钉住
-	// 内容，即可获得确定性的回收保护。仅存在于内存，重启后清空
-	// （重启后未完成上传的临时文件本就会被恢复流程清除）。
-	pins map[Digest]int
+	// pinFiles 记录本进程创建的钉住文件名（digest -> 文件名列表），
+	// 供 Unpin 时定位要删除的文件。钉住的真实状态在磁盘 pins/ 目录
+	// 中（见 pins.go），因此跨进程可见；本表只是本进程的句柄簿记。
+	pinFiles map[Digest][]string
 }
 
 // Open 打开（必要时创建）位于 dir 的存储，并执行崩溃恢复：
@@ -68,12 +67,12 @@ func Open(dir string, logger Logger) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("store: empty directory")
 	}
-	for _, sub := range []string{blobsDir, tagsDir, uploadsDir} {
+	for _, sub := range []string{blobsDir, tagsDir, uploadsDir, pinsDir} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
 			return nil, fmt.Errorf("store: init %s: %w", sub, err)
 		}
 	}
-	s := &Store{dir: dir, logger: logger, pins: make(map[Digest]int)}
+	s := &Store{dir: dir, logger: logger, pinFiles: make(map[Digest][]string)}
 	if err := s.recover(); err != nil {
 		return nil, err
 	}
@@ -84,9 +83,12 @@ func Open(dir string, logger Logger) (*Store, error) {
 // Close 关闭存储（当前为无操作，保留用于未来扩展）。
 func (s *Store) Close() error { return nil }
 
-// Pin 钉住一个摘要：计数 +1，被钉住的内容不会被 GC 回收。
+// Pin 钉住一个摘要：被钉住的内容不会被任何进程的 GC 回收。
 // 不要求内容已存在，可在上传前调用以覆盖整个"上传+引用"窗口。
-// 每次 Pin 必须配对一次 Unpin。钉住状态仅在内存中，重启后清空。
+// 每次 Pin 必须配对一次 Unpin。
+//
+// 钉住状态持久化在 pins/ 目录并携带本进程 PID：本进程退出而未
+// Unpin 时，残留钉住会被后续进程的 GC/恢复流程自动收割（见 pins.go）。
 func (s *Store) Pin(d Digest) {
 	unlock, err := s.lockWrite()
 	if err != nil {
@@ -94,11 +96,16 @@ func (s *Store) Pin(d Digest) {
 		return
 	}
 	defer unlock()
-	s.pins[d]++
-	s.logf("pin digest=%s count=%d", d, s.pins[d])
+	name, err := s.createPinFileLocked(d)
+	if err != nil {
+		s.logf("pin digest=%s create error: %v", d, err)
+		return
+	}
+	s.pinFiles[d] = append(s.pinFiles[d], name)
+	s.logf("pin digest=%s count=%d file=%s", d, len(s.pinFiles[d]), name)
 }
 
-// Unpin 解除一次钉住；计数归零后内容重新可被 GC 回收。
+// Unpin 解除一次钉住；本进程的钉住全部解除后，内容重新可被 GC 回收。
 func (s *Store) Unpin(d Digest) {
 	unlock, err := s.lockWrite()
 	if err != nil {
@@ -106,13 +113,26 @@ func (s *Store) Unpin(d Digest) {
 		return
 	}
 	defer unlock()
-	if s.pins[d] <= 1 {
-		delete(s.pins, d)
-		s.logf("unpin digest=%s count=0", d)
+	files := s.pinFiles[d]
+	if len(files) == 0 {
+		s.logf("unpin digest=%s: no pin held by this process", d)
 		return
 	}
-	s.pins[d]--
-	s.logf("unpin digest=%s count=%d", d, s.pins[d])
+	last := files[len(files)-1]
+	if err := os.Remove(filepath.Join(s.pinsPath(), last)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		s.logf("unpin digest=%s remove %s error: %v", d, last, err)
+		return
+	}
+	if err := fsyncDir(s.pinsPath()); err != nil {
+		s.logf("unpin digest=%s fsync error: %v", d, err)
+	}
+	files = files[:len(files)-1]
+	if len(files) == 0 {
+		delete(s.pinFiles, d)
+	} else {
+		s.pinFiles[d] = files
+	}
+	s.logf("unpin digest=%s count=%d", d, len(files))
 }
 
 func (s *Store) logf(format string, args ...any) {
