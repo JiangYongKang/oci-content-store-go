@@ -23,7 +23,17 @@ func isTempTagName(name string) bool {
 //
 // blobs/ 下只存在经原子 rename 发布的完整内容，无需校验即可信；
 // 无法识别的文件保留不动（向前兼容）。
+//
+// 整个恢复过程在跨进程独占文件锁下执行：此刻不可能有其他进程正在
+// 写入暂存文件或发布标签，因此 uploads/ 与 tags/ 下的残留一定属于
+// 已崩溃（或已退出）的进程，可以安全清除。
 func (s *Store) recover() error {
+	unlock, err := s.lockWrite()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	// 1. 清理未完成上传。
 	uploads := s.uploadsPath()
 	entries, err := os.ReadDir(uploads)

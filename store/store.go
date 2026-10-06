@@ -88,16 +88,24 @@ func (s *Store) Close() error { return nil }
 // 不要求内容已存在，可在上传前调用以覆盖整个"上传+引用"窗口。
 // 每次 Pin 必须配对一次 Unpin。钉住状态仅在内存中，重启后清空。
 func (s *Store) Pin(d Digest) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lockWrite()
+	if err != nil {
+		s.logf("pin digest=%s lock error: %v", d, err)
+		return
+	}
+	defer unlock()
 	s.pins[d]++
 	s.logf("pin digest=%s count=%d", d, s.pins[d])
 }
 
 // Unpin 解除一次钉住；计数归零后内容重新可被 GC 回收。
 func (s *Store) Unpin(d Digest) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lockWrite()
+	if err != nil {
+		s.logf("unpin digest=%s lock error: %v", d, err)
+		return
+	}
+	defer unlock()
 	if s.pins[d] <= 1 {
 		delete(s.pins, d)
 		s.logf("unpin digest=%s count=0", d)
@@ -150,8 +158,11 @@ func (s *Store) PutContent(ctx context.Context, desc Descriptor, r io.Reader) er
 		desc.Size = -1 // 规范化：未知长度，由存储实际计算
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lockWrite()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	finalPath := s.blobPath(desc.Digest)
 	if info, err := os.Stat(finalPath); err == nil {
@@ -268,8 +279,11 @@ func (s *Store) GetContent(ctx context.Context, d Digest) ([]byte, error) {
 	if err := d.Validate(); err != nil {
 		return nil, err
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	unlock, err := s.lockRead()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	b, err := os.ReadFile(s.blobPath(d))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -285,8 +299,11 @@ func (s *Store) StatContent(ctx context.Context, d Digest) (Descriptor, error) {
 	if err := d.Validate(); err != nil {
 		return Descriptor{}, err
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	unlock, err := s.lockRead()
+	if err != nil {
+		return Descriptor{}, err
+	}
+	defer unlock()
 	info, err := os.Stat(s.blobPath(d))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -319,8 +336,11 @@ func (s *Store) PutManifest(ctx context.Context, tag string, m Manifest) (Descri
 		Size:      int64(len(b)),
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lockWrite()
+	if err != nil {
+		return Descriptor{}, err
+	}
+	defer unlock()
 
 	// 引用完整性预检：缺失引用时拒绝，保证标签永远不会悬挂。
 	for _, ref := range m.references() {
@@ -393,8 +413,11 @@ func (s *Store) Resolve(ctx context.Context, tag string) (Descriptor, error) {
 	if err := validateTag(tag); err != nil {
 		return Descriptor{}, err
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	unlock, err := s.lockRead()
+	if err != nil {
+		return Descriptor{}, err
+	}
+	defer unlock()
 	d, err := s.readTagLocked(tag)
 	if err != nil {
 		return Descriptor{}, err
@@ -439,8 +462,11 @@ func (s *Store) GetManifest(ctx context.Context, d Digest) (Manifest, error) {
 
 // ListTags 返回所有标签，按字典序排序。
 func (s *Store) ListTags(ctx context.Context) ([]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	unlock, err := s.lockRead()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	entries, err := os.ReadDir(filepath.Join(s.dir, tagsDir))
 	if err != nil {
 		return nil, err
@@ -461,8 +487,11 @@ func (s *Store) DeleteTag(ctx context.Context, tag string) error {
 	if err := validateTag(tag); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lockWrite()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if err := os.Remove(s.tagPath(tag)); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("%w: tag %q", ErrNotFound, tag)
@@ -476,7 +505,10 @@ func (s *Store) DeleteTag(ctx context.Context, tag string) error {
 // GC 回收不被任何标签间接引用的 blob，返回被删除内容的描述符。
 // 可达性判定与删除在同一把写锁下完成：引用仍然有效的内容不可能被删除。
 func (s *Store) GC(ctx context.Context) ([]Descriptor, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lockWrite()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	return s.gcLocked()
 }
